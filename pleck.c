@@ -5,6 +5,8 @@
  * direct play of the original file). The UI blocks in read() when idle and in
  * poll() during playback, so it uses no CPU unless a key is pressed.
  *
+ * Lower qualities ask the server to transcode to HLS at a capped bitrate.
+ *
  *   pleck          browse and play (signs in on first run)
  *   pleck logout   forget the stored token
  */
@@ -381,6 +383,18 @@ static double jnum(JVal *o, const char *k)
 /* ---------- config ---------- */
 
 static char cfg_dir[900], cfg_path[1024], client_id[64], token[256];
+
+/* Stream qualities; 0 plays the original file, the rest transcode on the server. */
+static const struct {
+	const char *name, *res;
+	int kbps;
+} quals[] = {
+	{"original", NULL, 0},        {"1080p 8 Mbps", "1920x1080", 8000}, {"720p 4 Mbps", "1280x720", 4000},
+	{"720p 2 Mbps", "1280x720", 2000}, {"480p 1.5 Mbps", "720x480", 1500},  {"360p 0.7 Mbps", "576x320", 720},
+	{"240p 0.3 Mbps", "420x240", 320},
+};
+#define NQUAL ((int)(sizeof quals / sizeof *quals))
+static int quality;
 static const char *plextv = "https://plex.tv";
 
 static void cfg_save(void)
@@ -389,7 +403,7 @@ static void cfg_save(void)
 	int fd = open(cfg_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (fd < 0)
 		die("cannot write %s: %s", cfg_path, strerror(errno));
-	dprintf(fd, "client_id=%s\ntoken=%s\n", client_id, token);
+	dprintf(fd, "client_id=%s\ntoken=%s\nquality=%d\n", client_id, token, quality);
 	close(fd);
 }
 
@@ -414,9 +428,13 @@ static void cfg_load(void)
 			snprintf(client_id, sizeof client_id, "%s", line + 10);
 		else if (!strncmp(line, "token=", 6))
 			snprintf(token, sizeof token, "%s", line + 6);
+		else if (!strncmp(line, "quality=", 8))
+			quality = atoi(line + 8);
 	}
 	if (f)
 		fclose(f);
+	if (quality < 0 || quality >= NQUAL)
+		quality = 0;
 
 	if (!client_id[0]) {
 		unsigned char r[16] = {0};
@@ -973,8 +991,9 @@ static void draw(void)
 		bfmt(&o, " %s", msg);
 	else
 		bfmt(&o,
-		     "\x1b[2m %d/%d   enter open   \xe2\x86\x90 back   / filter   b play from start   w watched   q quit\x1b[0m",
-		     v->nvis ? v->sel + 1 : 0, v->nvis);
+		     "\x1b[2m %d/%d   enter open   \xe2\x86\x90 back   / filter   v quality: %s   b play from start   w watched"
+		     "   q quit\x1b[0m",
+		     v->nvis ? v->sel + 1 : 0, v->nvis, quals[quality].name);
 	bputs(&o, "\x1b[K");
 	msg[0] = 0;
 	if (write(1, o.p, o.n) < 0) {
@@ -1014,7 +1033,7 @@ static void play(Item *it, int resume)
 	int sv[2], started = 0, paused = 0;
 	double pos = resume ? it->off : 0;
 	Buf c = {0};
-	char line[8192];
+	char line[8192], session[96] = "";
 	size_t ln = 0;
 
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
@@ -1051,10 +1070,33 @@ static void play(Item *it, int resume)
 	bputs(&c, "\"]}\n");
 	if (pos > 0)
 		bfmt(&c, "{\"command\":[\"set_property\",\"options/start\",\"%d\"]}\n", (int)pos);
+	/*
+	 * The server refuses to transcode (HTTP 400) for a platform it has no
+	 * client profile for, so transcode requests borrow Chrome's: HLS, H.264, AAC.
+	 */
+	if (quality) {
+		snprintf(session, sizeof session, "%s-%lx", client_id, (unsigned long)time(NULL));
+		bputs(&c, "{\"command\":[\"set_property\",\"options/http-header-fields\",\"X-Plex-Token: ");
+		bjson(&c, cur->token);
+		bfmt(&c, ",X-Plex-Client-Identifier: %s,X-Plex-Session-Identifier: %s,X-Plex-Product: pleck"
+		         ",X-Plex-Platform: Chrome\"]}\n",
+		     client_id, session);
+	}
+	if (quality) /* the server can take a while to start transcoding; say so in the player window */
+		bputs(&c, "{\"command\":[\"show-text\",\"Waiting for the server to transcode...\",600000]}\n");
 	bputs(&c, "{\"command\":[\"loadfile\",\"");
 	bjson(&c, cur->base);
-	bjson(&c, it->part);
-	bputs(&c, "?X-Plex-Token=");
+	if (quality)
+		bfmt(&c,
+		     "/video/:/transcode/universal/start.m3u8?path=%%2Flibrary%%2Fmetadata%%2F%s&mediaIndex=0&partIndex=0"
+		     "&protocol=hls&directPlay=0&directStream=1&directStreamAudio=1&fastSeek=1&copyts=1&location=wan"
+		     "&videoQuality=100&videoResolution=%s&maxVideoBitrate=%d&session=%s&X-Plex-Session-Identifier=%s"
+		     "&X-Plex-Client-Identifier=%s&X-Plex-Product=pleck&X-Plex-Platform=Chrome&X-Plex-Token=",
+		     it->key, quals[quality].res, quals[quality].kbps, session, session, client_id);
+	else {
+		bjson(&c, it->part);
+		bputs(&c, "?X-Plex-Token=");
+	}
 	bjson(&c, cur->token);
 	bputs(&c, "\"]}\n");
 	if (write(sv[0], c.p, c.n) < 0) {
@@ -1062,7 +1104,8 @@ static void play(Item *it, int resume)
 	memset(c.p, 0, c.n);
 	free(c.p);
 
-	status("Playing %s \xe2\x80\x94 quit mpv to come back", it->title + strspn(it->title, " "));
+	status("Playing %s (%s) \xe2\x80\x94 quit mpv to come back", it->title + strspn(it->title, " "),
+	       quals[quality].name);
 
 	static const char ask[] = "{\"command\":[\"get_property\",\"time-pos\"],\"request_id\":1}\n"
 	                          "{\"command\":[\"get_property\",\"pause\"],\"request_id\":2}\n";
@@ -1091,6 +1134,11 @@ static void play(Item *it, int resume)
 			*nl = 0;
 			JVal *j = jparse(s, &ja);
 			const char *err = jstrv(j, "error"), *ev = jstrv(j, "event"), *why = jstrv(j, "reason");
+			if (ev && session[0] && !strcmp(ev, "playback-restart")) {
+				static const char clear[] = "{\"command\":[\"show-text\",\"\",1]}\n";
+				if (write(sv[0], clear, sizeof clear - 1) < 0) {
+				}
+			}
 			if (ev && why && !strcmp(ev, "end-file") && !strcmp(why, "eof") && it->dur) {
 				pos = it->dur; /* played to the end */
 				started = 1;
@@ -1117,6 +1165,13 @@ static void play(Item *it, int resume)
 	waitpid(pid, &ws, 0);
 	if (WIFEXITED(ws) && WEXITSTATUS(ws) == 127)
 		snprintf(msg, sizeof msg, "Could not run mpv \xe2\x80\x94 is it installed and on PATH?");
+	if (session[0]) { /* release the server's transcoder */
+		char url[2048], keep[sizeof msg];
+		snprintf(url, sizeof url, "%s/video/:/transcode/universal/stop?session=%s", cur->base, session);
+		memcpy(keep, msg, sizeof msg);
+		http("GET", url, cur->token, &resp, 5);
+		memcpy(msg, keep, sizeof msg);
+	}
 	if (started) {
 		timeline(it, "stopped", pos);
 		if (it->dur && pos >= it->dur * 0.9) {
@@ -1338,6 +1393,14 @@ int main(int argc, char **argv)
 			break;
 		case '/':
 			filtering = 1;
+			break;
+		case 'v':
+			quality = (quality + 1) % NQUAL;
+			cfg_save();
+			break;
+		case 'V':
+			quality = (quality + NQUAL - 1) % NQUAL;
+			cfg_save();
 			break;
 		}
 	}
