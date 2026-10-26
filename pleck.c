@@ -11,6 +11,7 @@
  *   pleck logout   forget the stored token
  */
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <curl/curl.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -395,6 +396,13 @@ static const struct {
 };
 #define NQUAL ((int)(sizeof quals / sizeof *quals))
 static int quality;
+
+/* Listing orders, applied on the client to whatever the server returned. */
+enum { SORT_SERVER, SORT_TITLE, SORT_ADDED, SORT_RELEASED, SORT_UNWATCHED, SORT_SIZE };
+static const char *sorts[] = {"server", "title", "recently added", "release date", "unwatched first", "largest"};
+#define NSORT ((int)(sizeof sorts / sizeof *sorts))
+static int sortmode;
+static int details; /* show file size and media info on each row */
 static const char *plextv = "https://plex.tv";
 
 static void cfg_save(void)
@@ -403,7 +411,8 @@ static void cfg_save(void)
 	int fd = open(cfg_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (fd < 0)
 		die("cannot write %s: %s", cfg_path, strerror(errno));
-	dprintf(fd, "client_id=%s\ntoken=%s\nquality=%d\n", client_id, token, quality);
+	dprintf(fd, "client_id=%s\ntoken=%s\nquality=%d\nsort=%d\ndetails=%d\n", client_id, token, quality,
+	        sortmode, details);
 	close(fd);
 }
 
@@ -430,11 +439,17 @@ static void cfg_load(void)
 			snprintf(token, sizeof token, "%s", line + 6);
 		else if (!strncmp(line, "quality=", 8))
 			quality = atoi(line + 8);
+		else if (!strncmp(line, "sort=", 5))
+			sortmode = atoi(line + 5);
+		else if (!strncmp(line, "details=", 8))
+			details = atoi(line + 8) != 0;
 	}
 	if (f)
 		fclose(f);
 	if (quality < 0 || quality >= NQUAL)
 		quality = 0;
+	if (sortmode < 0 || sortmode >= NSORT)
+		sortmode = 0;
 
 	if (!client_id[0]) {
 		unsigned char r[16] = {0};
@@ -506,6 +521,8 @@ static long http(const char *method, const char *url, const char *tok, Buf *out,
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, err);
 	if (!strcmp(method, "POST"))
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+	else if (strcmp(method, "GET"))
+		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
 	CURLcode rc = curl_easy_perform(curl);
 	if (rc == CURLE_OK)
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
@@ -691,9 +708,16 @@ enum { IT_SERVER, IT_DIR, IT_VIDEO };
 typedef struct {
 	char *title, *key; /* key: path to list (dir) or ratingKey (video) */
 	char *part;        /* video: path of the media file */
+	char *sortt;       /* title to sort by */
+	char *rk;          /* ratingKey of something deletable (movie, episode, show, season), else NULL */
+	long added;        /* unix time */
+	int released;      /* YYYYMMDD, or 0 */
+	double size;       /* video: bytes of the media file */
+	char *info;        /* details mode: resolution, codecs, ... or episode counts */
 	int kind, srv;
 	int dur, off; /* seconds */
 	int watched, leaf, seen;
+	int deleted;
 } Item;
 
 typedef struct View {
@@ -704,6 +728,7 @@ typedef struct View {
 	int n, cap;
 	int *vis, nvis; /* indices of items matching the filter */
 	int sel, top;
+	int sorted; /* sortmode that vis is ordered by */
 	char filter[64];
 } View;
 
@@ -723,14 +748,85 @@ static Item *push_item(View *v)
 	return it;
 }
 
+/* Case-insensitive, with runs of digits compared by value: "Season 2" < "Season 10". */
+static int natcmp(const char *a, const char *b)
+{
+	while (*a && *b) {
+		if (isdigit((unsigned char)*a) && isdigit((unsigned char)*b)) {
+			while (*a == '0')
+				a++;
+			while (*b == '0')
+				b++;
+			size_t na = strspn(a, "0123456789"), nb = strspn(b, "0123456789");
+			if (na != nb)
+				return na < nb ? -1 : 1;
+			int d = strncmp(a, b, na);
+			if (d)
+				return d;
+			a += na;
+			b += nb;
+			continue;
+		}
+		int d = tolower((unsigned char)*a) - tolower((unsigned char)*b);
+		if (d)
+			return d;
+		a++;
+		b++;
+	}
+	return (unsigned char)*a - (unsigned char)*b;
+}
+
+/* in progress, then untouched, then watched */
+static int unwatched_rank(const Item *it)
+{
+	if (it->kind == IT_VIDEO)
+		return it->off > 0 ? 0 : it->watched ? 2 : 1;
+	return it->leaf > it->seen ? (it->seen ? 0 : 1) : 2;
+}
+
+static View *sorting; /* qsort has no context argument */
+
+static int cmp_items(const void *pa, const void *pb)
+{
+	int a = *(const int *)pa, b = *(const int *)pb, d = 0;
+	const Item *x = &sorting->items[a], *y = &sorting->items[b];
+	switch (sortmode) {
+	case SORT_TITLE: d = natcmp(x->sortt, y->sortt); break;
+	case SORT_ADDED: d = (y->added > x->added) - (y->added < x->added); break;
+	case SORT_RELEASED: d = (y->released > x->released) - (y->released < x->released); break;
+	case SORT_UNWATCHED: d = unwatched_rank(x) - unwatched_rank(y); break;
+	case SORT_SIZE: d = (y->size > x->size) - (y->size < x->size); break;
+	}
+	return d ? d : a - b; /* ties keep the server's order */
+}
+
+static void sort_view(View *v)
+{
+	sorting = v;
+	if (v->nvis > 1)
+		qsort(v->vis, (size_t)v->nvis, sizeof *v->vis, cmp_items);
+	v->sorted = sortmode;
+}
+
+/* Reorder under the current sortmode, keeping the same item selected. */
+static void resort(View *v)
+{
+	int keep = v->nvis ? v->vis[v->sel] : -1;
+	sort_view(v);
+	for (int i = 0; i < v->nvis; i++)
+		if (v->vis[i] == keep)
+			v->sel = i;
+}
+
 static void refilter(View *v)
 {
 	if (!v->vis && v->n && !(v->vis = malloc(sizeof(int) * (size_t)v->n)))
 		die("out of memory");
 	v->nvis = 0;
 	for (int i = 0; i < v->n; i++)
-		if (!v->filter[0] || strcasestr(v->items[i].title, v->filter))
+		if (!v->items[i].deleted && (!v->filter[0] || strcasestr(v->items[i].title, v->filter)))
 			v->vis[v->nvis++] = i;
+	sort_view(v);
 	v->sel = v->top = 0;
 }
 
@@ -742,6 +838,31 @@ static void free_view(View *v)
 	free(v);
 }
 
+/* "1080p hevc · eac3 5.1 · mkv · 12.3 Mbps", from the first Media of a video */
+static char *media_info(Arena *a, JVal *md)
+{
+	char grp[4][64] = {"", "", "", ""}, out[300] = "";
+	const char *res = jstrv(md, "videoResolution"), *vc = jstrv(md, "videoCodec"), *ac = jstrv(md, "audioCodec"),
+	           *box = jstrv(md, "container");
+	int chans = (int)jnum(md, "audioChannels"), kbps = (int)jnum(md, "bitrate");
+
+	if (res || vc)
+		snprintf(grp[0], sizeof grp[0], "%s%s%s%s",
+		         !res ? "" : !strcasecmp(res, "4k") ? "4K" : !strcasecmp(res, "sd") ? "SD" : res,
+		         res && *res && isdigit((unsigned char)res[strlen(res) - 1]) ? "p" : "", res && vc ? " " : "", vc ? vc : "");
+	if (ac)
+		snprintf(grp[1], sizeof grp[1], "%s%s", ac,
+		         chans == 1 ? " mono" : chans == 2 ? " stereo" : chans == 6 ? " 5.1" : chans == 8 ? " 7.1" : "");
+	if (box)
+		snprintf(grp[2], sizeof grp[2], "%s", box);
+	if (kbps)
+		snprintf(grp[3], sizeof grp[3], "%.1f Mbps", kbps / 1000.0);
+	for (int i = 0; i < 4; i++)
+		if (grp[i][0])
+			snprintf(out + strlen(out), sizeof out - strlen(out), "%s%s", out[0] ? " \xc2\xb7 " : "", grp[i]);
+	return out[0] ? astrdup(a, out) : NULL;
+}
+
 static void add_item(View *v, JVal *m)
 {
 	const char *type = jstrv(m, "type"), *title = jstrv(m, "title"), *key = jstrv(m, "key");
@@ -749,6 +870,12 @@ static void add_item(View *v, JVal *m)
 
 	if (!title || !key)
 		return;
+	const char *ts = jstrv(m, "titleSort"), *oaa = jstrv(m, "originallyAvailableAt");
+	int y, mo, d, released = 0;
+	if (oaa && sscanf(oaa, "%d-%d-%d", &y, &mo, &d) == 3)
+		released = y * 10000 + mo * 100 + d;
+	else if (jget(m, "year"))
+		released = (int)jnum(m, "year") * 10000;
 	if (type && (!strcmp(type, "artist") || !strcmp(type, "photo") || !strcmp(type, "album") ||
 	             !strcmp(type, "track")))
 		return;
@@ -768,11 +895,16 @@ static void add_item(View *v, JVal *m)
 		Item *it = push_item(v);
 		it->kind = IT_VIDEO;
 		it->title = astrdup(&v->a, tbuf);
-		it->key = astrdup(&v->a, rk);
+		it->key = it->rk = astrdup(&v->a, rk);
 		it->part = astrdup(&v->a, pk);
 		it->dur = (int)(jnum(m, "duration") / 1000);
 		it->off = (int)(jnum(m, "viewOffset") / 1000);
 		it->watched = jnum(m, "viewCount") > 0;
+		it->sortt = ts && strcmp(type, "episode") ? astrdup(&v->a, ts) : it->title;
+		it->added = (long)jnum(m, "addedAt");
+		it->released = released;
+		it->size = jnum(parts->child, "size");
+		it->info = media_info(&v->a, media->child);
 		return;
 	}
 	if (key[0] != '/') { /* library sections are listed by bare id */
@@ -783,8 +915,25 @@ static void add_item(View *v, JVal *m)
 	it->kind = IT_DIR;
 	it->title = astrdup(&v->a, title);
 	it->key = astrdup(&v->a, key);
+	if (rk && type && (!strcmp(type, "show") || !strcmp(type, "season")))
+		it->rk = astrdup(&v->a, rk);
 	it->leaf = (int)jnum(m, "leafCount");
 	it->seen = (int)jnum(m, "viewedLeafCount");
+	it->sortt = ts ? astrdup(&v->a, ts) : it->title;
+	it->added = (long)jnum(m, "addedAt");
+	it->released = released;
+	int seasons = (int)jnum(m, "childCount");
+	if (type && !strcmp(type, "show") && seasons)
+		snprintf(tbuf, sizeof tbuf, "%d season%s \xc2\xb7 %d episode%s", seasons, seasons == 1 ? "" : "s", it->leaf,
+		         it->leaf == 1 ? "" : "s");
+	else if (type && !strcmp(type, "season"))
+		snprintf(tbuf, sizeof tbuf, "%d episode%s", it->leaf, it->leaf == 1 ? "" : "s");
+	else
+		tbuf[0] = 0;
+	if (jget(m, "year") && type && !strcmp(type, "show"))
+		snprintf(tbuf + strlen(tbuf), sizeof tbuf - strlen(tbuf), "%s%d", tbuf[0] ? " \xc2\xb7 " : "",
+		         (int)jnum(m, "year"));
+	it->info = tbuf[0] ? astrdup(&v->a, tbuf) : NULL;
 }
 
 /* Fetch a server directory listing, PAGE items at a time. */
@@ -928,6 +1077,20 @@ static void fmt_dur(char *out, size_t n, int sec)
 		snprintf(out, n, "%dm", sec / 60 > 0 ? sec / 60 : 1);
 }
 
+static void fmt_size(char *out, size_t n, double bytes)
+{
+	if (bytes >= 1e12)
+		snprintf(out, n, "%.2f TB", bytes / 1e12);
+	else if (bytes >= 1e9)
+		snprintf(out, n, "%.1f GB", bytes / 1e9);
+	else if (bytes >= 1e6)
+		snprintf(out, n, "%.0f MB", bytes / 1e6);
+	else if (bytes > 0)
+		snprintf(out, n, "%.0f KB", bytes / 1e3 > 1 ? bytes / 1e3 : 1);
+	else
+		out[0] = 0;
+}
+
 static void crumbs(Buf *o, View *v)
 {
 	if (v->parent) {
@@ -959,6 +1122,15 @@ static void draw(void)
 	bputs(&o, "\x1b[0m");
 	if (filtering || v->filter[0])
 		bfmt(&o, "   /%s%s", v->filter, filtering ? "_" : "");
+	if (details) {
+		double total = 0;
+		char t[32];
+		for (int i = 0; i < v->nvis; i++)
+			total += v->items[v->vis[i]].size;
+		fmt_size(t, sizeof t, total);
+		if (t[0])
+			bfmt(&o, "\x1b[2m   %s\x1b[22m", t);
+	}
 	bputs(&o, "\x1b[K\r\n");
 	for (int i = 0; i < body; i++) {
 		int k = v->top + i;
@@ -972,7 +1144,12 @@ static void draw(void)
 				mark = "\xe2\x97\x8f";
 			if (k == v->sel)
 				bputs(&o, "\x1b[7m");
-			bfmt(&o, " %s %s", mark, it->title);
+			bfmt(&o, " %s ", mark);
+			if (details) {
+				fmt_size(d, sizeof d, it->size);
+				bfmt(&o, "\x1b[2m%8s\x1b[22m  ", d);
+			}
+			bputs(&o, it->title);
 			if (it->kind == IT_VIDEO && it->dur) {
 				fmt_dur(d, sizeof d, it->dur);
 				if (it->off > 0) {
@@ -982,6 +1159,8 @@ static void draw(void)
 					bfmt(&o, "\x1b[2m   %s\x1b[22m", d);
 			} else if (it->kind == IT_DIR && it->leaf > it->seen)
 				bfmt(&o, "\x1b[2m   %d unwatched\x1b[22m", it->leaf - it->seen);
+			if (details && it->info)
+				bfmt(&o, "\x1b[2m   %s\x1b[22m", it->info);
 			bputs(&o, " \x1b[0m");
 		} else if (i == 0)
 			bputs(&o, "\x1b[2m   (nothing here)\x1b[0m");
@@ -990,14 +1169,57 @@ static void draw(void)
 	if (msg[0])
 		bfmt(&o, " %s", msg);
 	else
-		bfmt(&o,
-		     "\x1b[2m %d/%d   enter open   \xe2\x86\x90 back   / filter   v quality: %s   b play from start   w watched"
-		     "   q quit\x1b[0m",
-		     v->nvis ? v->sel + 1 : 0, v->nvis, quals[quality].name);
+		bfmt(&o, "\x1b[2m %d/%d   quality: %s   sort: %s   ? help\x1b[0m", v->nvis ? v->sel + 1 : 0, v->nvis,
+		     quals[quality].name, sorts[sortmode]);
 	bputs(&o, "\x1b[K");
 	msg[0] = 0;
 	if (write(1, o.p, o.n) < 0) {
 	}
+}
+
+/* Full-screen list of keys; any key returns. */
+static void help(void)
+{
+	static const char *keys[][2] = {
+		{"\xe2\x86\x91 \xe2\x86\x93  j k", "move"},
+		{"PgUp PgDn  ^B ^F  space", "page"},
+		{"g G  Home End", "first / last"},
+		{"enter  \xe2\x86\x92  l", "open, or play from where you left off"},
+		{"\xe2\x86\x90  h  backspace", "back"},
+		{"b", "play from the start"},
+		{"r", "play something random from here"},
+		{"w", "mark watched / unwatched"},
+		{"/", "filter (enter keeps it, esc clears it)"},
+		{"s S", "next / previous sort"},
+		{"v V", "next / previous quality"},
+		{"i", "details: file size, resolution, codecs"},
+		{"D", "delete from the server, files too (asks first)"},
+		{"q", "quit"},
+	};
+	Buf o = {0};
+	int k;
+
+	bputs(&o, "\x1b[H\x1b[2J\x1b[1m pleck \xe2\x80\xba keys\x1b[0m\r\n\r\n");
+	for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
+		/* pad by display width: the arrows are three bytes but one column */
+		int w = 0;
+		for (const char *c = keys[i][0]; *c; c++)
+			w += ((unsigned char)*c & 0xC0) != 0x80;
+		bfmt(&o, "   %s%*s%s\r\n", keys[i][0], 26 - w, "", keys[i][1]);
+	}
+	bputs(&o, "\r\n\x1b[2m   sort:    ");
+	for (int i = 0; i < NSORT; i++)
+		bfmt(&o, "%s%s%s%s", i ? ", " : "", i == sortmode ? "\x1b[22;1m" : "", sorts[i], i == sortmode ? "\x1b[22;2m" : "");
+	bputs(&o, "\r\n   quality: ");
+	for (int i = 0; i < NQUAL; i++)
+		bfmt(&o, "%s%s%s%s", i ? ", " : "", i == quality ? "\x1b[22;1m" : "", quals[i].name, i == quality ? "\x1b[22;2m" : "");
+	bputs(&o, "\x1b[0m\r\n\r\n\x1b[2m   press any key\x1b[0m");
+	do {
+		if (write(1, o.p, o.n) < 0) {
+		}
+		k = readkey();
+	} while (k == KEY_RESIZE);
+	free(o.p);
 }
 
 static void status(const char *fmt, ...)
@@ -1060,7 +1282,8 @@ static void play(Item *it, int resume)
 		for (int fd = 4; fd < 256; fd++)
 			close(fd);
 		execlp("mpv", "mpv", "--idle=once", "--force-window=immediate", "--no-terminal",
-		       "--hwdec=auto-safe", "--input-ipc-client=fd://3", (char *)NULL);
+		       "--hwdec=auto-safe", "--geometry=33%-0-0", "--ontop", "--input-ipc-client=fd://3",
+		       (char *)NULL);
 		_exit(127);
 	}
 	close(sv[1]);
@@ -1195,6 +1418,51 @@ static void toggle_watched(Item *it)
 		snprintf(msg, sizeof msg, "Could not update watched state");
 }
 
+/*
+ * Ask the server to delete the item along with its media files. The server
+ * only allows this for its owner, with "Allow media deletion" turned on.
+ */
+static void delete_selected(void)
+{
+	View *v = view;
+	Item *it = v->nvis ? &v->items[v->vis[v->sel]] : NULL;
+	const char *name;
+	char url[2048];
+	int k;
+
+	if (!it || !it->rk) {
+		snprintf(msg, sizeof msg, "Only movies, episodes, shows and seasons can be deleted");
+		return;
+	}
+	char sz[32] = "";
+	name = it->title + strspn(it->title, " ");
+	if (it->size > 0) {
+		sz[0] = ' ';
+		sz[1] = '(';
+		fmt_size(sz + 2, sizeof sz - 3, it->size);
+		strcat(sz, ")");
+	}
+	status("\x1b[1mDelete %s%s and its files from %s?\x1b[0m This cannot be undone. [y/N]", name, sz, cur->name);
+	do
+		k = readkey();
+	while (k == KEY_RESIZE);
+	if (k != 'y' && k != 'Y')
+		return;
+	status("Deleting %s...", name);
+	snprintf(url, sizeof url, "%s/library/metadata/%s", cur->base, it->rk);
+	long st = http("DELETE", url, cur->token, &resp, 30);
+	if (st == 200 || st == 204) {
+		it->deleted = 1;
+		memmove(&v->vis[v->sel], &v->vis[v->sel + 1], sizeof *v->vis * (size_t)(v->nvis - v->sel - 1));
+		v->nvis--;
+		snprintf(msg, sizeof msg, "Deleted %s", name);
+	} else if (st == 401 || st == 403)
+		snprintf(msg, sizeof msg, "%s refused: turn on \"Allow media deletion\" in its settings (owner only)",
+		         cur->name);
+	else if (st >= 0)
+		snprintf(msg, sizeof msg, "Could not delete %s (HTTP %ld)", name, st);
+}
+
 /* ---------- main ---------- */
 
 static Item *selected(void)
@@ -1245,6 +1513,77 @@ static void go_back(void)
 	free_view(view);
 	view = p;
 	filtering = 0;
+	if (view->sorted != sortmode)
+		resort(view);
+}
+
+/*
+ * Odds for a random pick: a video counts once and a show or season counts once
+ * per episode, so every episode in reach is equally likely. Directories that
+ * don't report a count (libraries, collections, folders) count once.
+ */
+static int weight(const Item *it)
+{
+	if (it->kind == IT_VIDEO)
+		return 1;
+	if (it->kind == IT_DIR)
+		return it->leaf > 0 ? it->leaf : 1;
+	return 0;
+}
+
+/* Index into v->vis of a weighted random item, or -1 if nothing is playable. */
+static int pick(View *v)
+{
+	long total = 0, r;
+	for (int i = 0; i < v->nvis; i++)
+		total += weight(&v->items[v->vis[i]]);
+	if (!total)
+		return -1;
+	r = random() % total;
+	for (int i = 0; i < v->nvis; i++)
+		if ((r -= weight(&v->items[v->vis[i]])) < 0)
+			return i;
+	return -1;
+}
+
+/*
+ * Play something random from under the current view (honouring its filter),
+ * descending through directories without opening them.
+ */
+static void play_random(void)
+{
+	View *v = view, *tmp = NULL;
+	char title[1024] = "";
+	int played = 0;
+
+	for (int depth = 0; depth < 8 && !played; depth++) {
+		int i = pick(v);
+		if (i < 0)
+			break;
+		Item *it = &v->items[v->vis[i]];
+		if (v == view)
+			view->sel = i;
+		snprintf(title + strlen(title), sizeof title - strlen(title), "%s%s", title[0] ? " \xe2\x80\xba " : "",
+		         it->title + strspn(it->title, " "));
+		if (it->kind == IT_VIDEO) {
+			if (tmp) /* name where it came from, since its view isn't on screen */
+				it->title = astrdup(&tmp->a, title);
+			play(it, 1);
+			played = 1;
+			break;
+		}
+		status("Picking something from %s...", it->title + strspn(it->title, " "));
+		View *n = load_view(it->key, it->title);
+		if (tmp)
+			free_view(tmp);
+		v = tmp = n;
+		if (!n)
+			return; /* load_view said why */
+	}
+	if (tmp)
+		free_view(tmp);
+	if (!played && !msg[0])
+		snprintf(msg, sizeof msg, "Nothing to play here");
 }
 
 int main(int argc, char **argv)
@@ -1262,6 +1601,7 @@ int main(int argc, char **argv)
 		fputs("usage: pleck [logout]\n", stderr);
 		return 2;
 	}
+	srandom((unsigned)time(NULL) ^ (unsigned)getpid());
 	curl_global_init(CURL_GLOBAL_DEFAULT);
 	if (!(curl = curl_easy_init()))
 		die("cannot initialise libcurl");
@@ -1287,7 +1627,7 @@ int main(int argc, char **argv)
 		Item *it = push_item(view);
 		it->kind = IT_SERVER;
 		it->srv = i;
-		it->title = srv[i].name;
+		it->title = it->sortt = srv[i].name;
 	}
 	refilter(view);
 
@@ -1376,6 +1716,9 @@ int main(int argc, char **argv)
 			if (selected() && selected()->kind == IT_VIDEO)
 				open_selected(0);
 			break;
+		case 'r':
+			play_random();
+			break;
 		case 'w':
 			if (selected() && selected()->kind == IT_VIDEO)
 				toggle_watched(selected());
@@ -1400,6 +1743,22 @@ int main(int argc, char **argv)
 			break;
 		case 'V':
 			quality = (quality + NQUAL - 1) % NQUAL;
+			cfg_save();
+			break;
+		case 'D':
+			delete_selected();
+			break;
+		case '?':
+			help();
+			break;
+		case 'i':
+			details = !details;
+			cfg_save();
+			break;
+		case 's':
+		case 'S':
+			sortmode = (sortmode + (k == 's' ? 1 : NSORT - 1)) % NSORT;
+			resort(v);
 			cfg_save();
 			break;
 		}

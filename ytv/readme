@@ -1,0 +1,9 @@
+youtube client
+
+needs mpv and yt-dlp. signs in with your browser's youtube cookies, which
+yt-dlp reads out each time ytv starts: safari on macos, firefox elsewhere.
+`ytv chrome` (or firefox, brave, firefox:<profile>, anything yt-dlp's
+--cookies-from-browser takes) switches browser and remembers it.
+
+safari keeps its cookies behind macos privacy settings: give your terminal
+Full Disk Access in System Settings › Privacy & Security.
